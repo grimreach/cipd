@@ -1,0 +1,34 @@
+{
+  "api_socket": "/run/cipd/cipd.sock",
+  "devices": [
+    {
+      "name": "logix1",
+      "transport": { "kind": "enip", "host": "192.168.1.10" },
+      "route": [ { "port": 1, "link": 0 } ],
+      "vendor_id": 4660,
+      "serial_number": 1,
+      "request_timeout_ms": 3000
+    },
+    {
+      "name": "slc505",
+      "transport": { "kind": "enip", "host": "192.168.1.20" }
+    },
+    {
+      "name": "plc5e_legacy",
+      "transport": { "kind": "csp", "host": "192.168.1.30" }
+    },
+    {
+      "name": "slc_serial",
+      "transport": {
+        "kind": "df1",
+        "port": "/dev/ttyUSB0",
+        "baud": 19200,
+        "crc": true,
+        "dst": 0,
+        "src": 1,
+        "ack_timeout_ms": 1000,
+        "max_retries": 3
+      }
+    }
+  ]
+}

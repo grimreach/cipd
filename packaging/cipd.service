@@ -1,0 +1,24 @@
+[Unit]
+Description=cipd — EtherNet/IP + DF1 to CIP/PCCC router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cipd /etc/cipd/config.json
+Restart=on-failure
+RestartSec=2
+# Hardening: cipd needs only network + the serial devices it is configured for.
+DynamicUser=yes
+RuntimeDirectory=cipd
+StateDirectory=cipd
+# Grant serial access by adding the dynamic user to the dialout group via udev/ACL,
+# or drop DynamicUser and run as a dedicated 'cipd' user in group 'dialout'.
+SupplementaryGroups=dialout
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
