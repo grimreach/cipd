@@ -11,6 +11,7 @@ mod enip;
 mod error;
 mod pccc;
 mod router;
+mod transfer;
 
 use std::path::PathBuf;
 use std::sync::Arc;

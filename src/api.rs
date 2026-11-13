@@ -17,6 +17,7 @@
 use crate::cip::{self, MrRequest};
 use crate::pccc::{self, WordType};
 use crate::router::Router;
+use crate::transfer::{self, FileSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -68,6 +69,13 @@ enum Request {
         values: Vec<serde_json::Value>,
         #[serde(default)]
         data: String,
+    },
+    /// Whole-program **upload** (read-only). `files` is the manifest a capture
+    /// decode (`ops/wire/pccc-files.py`) produces: each file's wire type code,
+    /// number, element count and bytes-per-element. Returns each file's raw bytes.
+    Upload {
+        device: String,
+        files: Vec<FileSpec>,
     },
 }
 
@@ -275,5 +283,26 @@ async fn dispatch(router: &Arc<Router>, req: Request) -> Response {
                 Err(e) => Response::Error { message: e.to_string() },
             }
         }
+
+        Request::Upload { device, files } => match router.device(&device) {
+            Ok(d) => match transfer::upload(&d, &files).await {
+                Ok(uploaded) => Response::Ok {
+                    data: serde_json::json!({
+                        "file_count": uploaded.len(),
+                        "files": uploaded
+                            .iter()
+                            .map(|f| serde_json::json!({
+                                "file_type": f.file_type,
+                                "file_number": f.file_number,
+                                "bytes": f.bytes.len(),
+                                "data": hex_encode(&f.bytes),
+                            }))
+                            .collect::<Vec<_>>(),
+                    }),
+                },
+                Err(e) => Response::Error { message: e.to_string() },
+            },
+            Err(e) => Response::Error { message: e.to_string() },
+        },
     }
 }
