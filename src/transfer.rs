@@ -7,22 +7,42 @@
 //! re-implement CIP/PCCC wrapping.
 //!
 //! What the capture showed for an upload: 413 protected-typed-logical-reads
-//! (CMD 0x0F FNC 0xA2), one file at a time, each read addressed as
-//! `size, file#, type, element, sub-element` (a byte, or `FF lo hi` when > 254),
-//! reassembled into that file's bytes. The *type codes seen on the wire* are
-//! (from `ops/wire/pccc-files.py`): O=0x82 I=0x83 S=0x84 B=0x85 T=0x86 C=0x87
-//! R=0x88 N=0x89 F=0x8A ST=0x8D L=0x91 MG=0x92 RIX=0x96; plus system/program/
-//! config files by their own codes. (These wire codes differ from the logical
-//! address-path codes in `pccc::file_type_info` for O/I — upload uses the wire
-//! codes, so the manifest carries the raw type byte and this module never maps.)
+//! (CMD 0x0F FNC 0xA2), one file at a time, reassembled into each file's bytes.
+//!
+//! ## Addressing — matched to the capture, not assumed
+//!
+//! RSLogix does **not** step by element. It reads each file as a flat array of
+//! **words**: the element field is fixed at `0x00`, the sub-element field carries
+//! a **word offset**, and every read is 0x50 (80 bytes = 40 words) except a
+//! shorter final read for the remainder. The sub-element steps 0, 40, 80, 120…
+//! words, switching to the `FF lo hi` extended form past 254. Verbatim from AP-01:
+//!
+//! ```text
+//!   N7   (type 0x89):  50 07 89 00 28 …   last  18 07 89 00 F0   (24 B at word 240)
+//!   T4   (type 0x86):  50 04 86 00 28 …   last  32 04 86 00 C8   (50 B at word 200)
+//!   LAD2 (type 0x22):  50 02 22 00 FF 18 01 (80 B at word 280)
+//!                      last  38 02 22 00 FF 40 01 (56 B at word 320)
+//! ```
+//!
+//! The same flat-word scheme holds for every type seen (N, T, C, ST, program
+//! files, …) — timers (6-byte elements) and strings (84-byte elements) are read
+//! on the same 40-word stride, so reads cross element boundaries freely. Because
+//! of that, the only per-file geometry this planner needs is the **total byte
+//! length**; element size matters only for the client that later decodes values.
+//!
+//! The *type codes seen on the wire* are (from `ops/wire/pccc-files.py`):
+//! O=0x82 I=0x83 S=0x84 B=0x85 T=0x86 C=0x87 R=0x88 N=0x89 F=0x8A ST=0x8D L=0x91
+//! MG=0x92 RIX=0x96; plus system/program/config files by their own codes. (These
+//! wire codes differ from the logical address-path codes in `pccc::file_type_info`
+//! for O/I — upload uses the wire codes, so the manifest carries the raw type byte
+//! and this module never maps.)
 //!
 //! Scope of this version: **upload only** (read-only, safe on any PLC). The file
-//! set + element counts are supplied as a manifest — exactly what
-//! `pccc-files.py` emits from a capture — because the type-0x03 directory layout
-//! that RSLogix reads first to enumerate files is not decoded yet. A later
-//! version can build the manifest from that directory. Download is NOT here: it
-//! is gated on four still-unknown pieces (0x03 directory build, 0F 88/8F payloads,
-//! the doubled 0x47/0x49/0x4D writes, the mode change) and on the bench PLC.
+//! set + geometry are supplied as a manifest — exactly what `pccc-files.py` emits
+//! from a capture — because the type-0x03 directory layout that RSLogix reads
+//! first to enumerate files is not decoded yet. Download is NOT here: it is gated
+//! on four still-unknown pieces (0x03 directory build, 0F 88/8F payloads, the
+//! doubled 0x47/0x49/0x4D writes, the mode change) and on the bench PLC.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -31,11 +51,16 @@ use crate::error::{Error, Result};
 use crate::pccc::{self, SlcAddress, WordType};
 use crate::router::Device;
 
-/// SLC per-request byte cap (matches `Device::ml_read`).
-pub const MAX_READ_BYTES: u16 = 240;
+/// Per-request byte cap. The AP-01 capture used 0x50 (80 bytes) for every full
+/// read; element stepping of program files and 240-byte reads are UNTESTED on the
+/// ML1400, so this stays at 80 until a bench test shows a larger read is accepted.
+pub const MAX_READ_BYTES: u16 = 80;
 
 /// One file to read during an upload: its wire type code, number, and geometry.
-/// This is the shape `ops/wire/pccc-files.py` reports per file.
+/// This is the shape `ops/wire/pccc-files.py` reports per file. `element_bytes`
+/// is not used to plan reads (RSLogix reads a flat word array; see module docs);
+/// it is retained because it is part of the manifest and lets a client decode
+/// values from the reassembled bytes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FileSpec {
     /// Wire type code as seen in the `0F A2` address (e.g. 0x89 for N).
@@ -54,42 +79,51 @@ impl FileSpec {
     }
 }
 
-/// A single `0F A2` read: starting element and byte count.
+/// A single `0F A2` read: starting **word offset** (the sub-element field) and
+/// byte count. Element is always 0 on the wire, matching the capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOp {
-    pub element: u16,
+    pub word_offset: u16,
     pub size: u8,
 }
 
-/// Split a file into element-aligned reads that each fit under `max_bytes`.
+/// Plan the reads for a file as RSLogix does: fixed-size chunks addressed by a
+/// flat word offset, stepping `max_bytes/2` words each time, with a shorter final
+/// read for the remainder.
 ///
-/// Pure and deterministic — this is the part proven by unit test; the wire I/O
-/// around it is a thin loop. Returns an error if a single element exceeds the
-/// per-request cap (no real ML1400 file element does; ST at 84 bytes is the
-/// largest), rather than guessing a sub-element split.
+/// Pure and deterministic — this is the part proven by unit test against the
+/// capture bytes; the wire I/O around it is a thin loop. `max_bytes` is clamped to
+/// an even value ≤ 254 so the byte count fits the single-byte DF1 size field and
+/// the stride is a whole number of words.
 pub fn plan_reads(spec: &FileSpec, max_bytes: u16) -> Result<Vec<ReadOp>> {
-    if spec.element_bytes == 0 {
-        return Err(Error::Protocol("file element_bytes = 0".into()));
+    let total = spec.total_bytes();
+    if total == 0 {
+        return Ok(Vec::new());
     }
-    if spec.element_bytes > max_bytes || spec.element_bytes > 255 {
+    if total % 2 != 0 {
         return Err(Error::Protocol(format!(
-            "element of {} bytes exceeds the {max_bytes}-byte read cap",
-            spec.element_bytes
+            "file type 0x{:02x} #{}: {total} bytes is not word-aligned",
+            spec.file_type, spec.file_number
         )));
     }
-    let per_chunk = (max_bytes / spec.element_bytes).max(1);
+    // Chunk size: even (whole words) and within the single-byte size field.
+    let chunk_bytes = (max_bytes.min(254) & !1).max(2);
+    let chunk_words = chunk_bytes / 2;
+
     let mut ops = Vec::new();
-    let mut e = 0u16;
-    while e < spec.elements {
-        let n = per_chunk.min(spec.elements - e);
-        let size = (n * spec.element_bytes) as u8; // guaranteed <= max_bytes <= 255
-        ops.push(ReadOp { element: e, size });
-        e += n;
+    let mut word = 0u16;
+    while (word as usize) * 2 < total {
+        let remaining = total - (word as usize) * 2;
+        let size = remaining.min(chunk_bytes as usize) as u8;
+        ops.push(ReadOp { word_offset: word, size });
+        word = word.saturating_add(chunk_words);
     }
     Ok(ops)
 }
 
 /// Reassemble read replies in order, verifying the total matches the file.
+/// Reads are contiguous and non-overlapping (each full read is `chunk_bytes` and
+/// the stride is `chunk_bytes/2` words), so concatenation reproduces the file.
 pub fn reassemble(spec: &FileSpec, chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(spec.total_bytes());
     for c in chunks {
@@ -107,16 +141,17 @@ pub fn reassemble(spec: &FileSpec, chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A raw address for an upload read (no logical letter/decode — the manifest
-/// already carries the wire type code).
-fn read_addr(file_type: u8, file_number: u16, element: u16) -> SlcAddress {
+/// A raw address for an upload read: element fixed at 0, word offset in the
+/// sub-element field (no logical letter/decode — the manifest already carries the
+/// wire type code). This mirrors exactly what the capture put on the wire.
+fn read_addr(file_type: u8, file_number: u16, word_offset: u16) -> SlcAddress {
     SlcAddress {
         letter: String::new(),
         file_number,
         file_type,
-        element,
-        sub_element: 0,
-        has_sub: false,
+        element: 0,
+        sub_element: word_offset,
+        has_sub: true,
         bit: None,
         element_size: 0,
         word_type: WordType::Raw,
@@ -152,7 +187,7 @@ pub async fn read_file(device: &Device, tns: &Tns, spec: &FileSpec) -> Result<Ve
     let ops = plan_reads(spec, MAX_READ_BYTES)?;
     let mut chunks = Vec::with_capacity(ops.len());
     for op in &ops {
-        let addr = read_addr(spec.file_type, spec.file_number, op.element);
+        let addr = read_addr(spec.file_type, spec.file_number, op.word_offset);
         let req = pccc::slc_typed_read_addr(tns.next(), op.size, &addr);
         let reply = device.pccc(&req).await?;
         chunks.push(reply.ok()?.to_vec());
@@ -185,68 +220,124 @@ mod tests {
         FileSpec { file_type, file_number, elements, element_bytes }
     }
 
+    /// Encode a planned read to its full `0F A2` request bytes, for comparison
+    /// against the capture.
+    fn wire(spec: &FileSpec, op: &ReadOp) -> Vec<u8> {
+        let addr = read_addr(spec.file_type, spec.file_number, op.word_offset);
+        pccc::slc_typed_read_addr(1, op.size, &addr).encode()
+    }
+
     #[test]
     fn plan_small_int_file_one_read() {
-        // N7 with 2 int16 elements = 4 bytes, one read.
+        // N7 with 2 int16 elements = 4 bytes, one read at word 0.
         let ops = plan_reads(&spec(0x89, 7, 2, 2), MAX_READ_BYTES).unwrap();
-        assert_eq!(ops, vec![ReadOp { element: 0, size: 4 }]);
+        assert_eq!(ops, vec![ReadOp { word_offset: 0, size: 4 }]);
     }
 
     #[test]
-    fn plan_large_int_file_chunks_on_element_boundary() {
-        // N7 with 252 int16 elements = 504 bytes. 240/2 = 120 elements/chunk.
-        let ops = plan_reads(&spec(0x89, 7, 252, 2), MAX_READ_BYTES).unwrap();
-        assert_eq!(ops.len(), 3);
-        assert_eq!(ops[0], ReadOp { element: 0, size: 240 });
-        assert_eq!(ops[1], ReadOp { element: 120, size: 240 });
-        // remainder: 252 - 240 = 12 elements = 24 bytes
-        assert_eq!(ops[2], ReadOp { element: 240, size: 24 });
-        // Every element is covered exactly once.
-        let covered: u16 = ops.iter().map(|o| o.size as u16 / 2).sum();
-        assert_eq!(covered, 252);
+    fn plan_n7_matches_capture() {
+        // N7 (type 0x89): 252 int16 = 504 bytes. 80-byte / 40-word stride.
+        let s = spec(0x89, 7, 252, 2);
+        let ops = plan_reads(&s, MAX_READ_BYTES).unwrap();
+        assert_eq!(ops.first(), Some(&ReadOp { word_offset: 0, size: 80 }));
+        assert_eq!(ops[1], ReadOp { word_offset: 40, size: 80 });
+        assert_eq!(ops.last(), Some(&ReadOp { word_offset: 240, size: 24 }));
+        // Second read on the wire: 50 07 89 00 28
+        assert_eq!(
+            wire(&s, &ops[1]),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x50, 0x07, 0x89, 0x00, 0x28]
+        );
+        // Last read on the wire: 18 07 89 00 F0
+        assert_eq!(
+            wire(&s, ops.last().unwrap()),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x18, 0x07, 0x89, 0x00, 0xF0]
+        );
+        // Contiguous full coverage.
+        let covered: usize = ops.iter().map(|o| o.size as usize).sum();
+        assert_eq!(covered, s.total_bytes());
     }
 
     #[test]
-    fn plan_timer_file_three_word_elements() {
-        // T4 with 75 elements * 6 bytes = 450 bytes. 240/6 = 40 elements/chunk.
-        let ops = plan_reads(&spec(0x86, 4, 75, 6), MAX_READ_BYTES).unwrap();
-        assert_eq!(ops[0], ReadOp { element: 0, size: 240 });
-        assert_eq!(ops[1], ReadOp { element: 40, size: 210 });
-        let covered: u16 = ops.iter().map(|o| o.size as u16 / 6).sum();
-        assert_eq!(covered, 75);
+    fn plan_t4_stride_is_words_not_elements() {
+        // T4 (type 0x86): 75 timers * 6 bytes = 450 bytes. Still a 40-word stride,
+        // so reads cross the 3-word element boundary.
+        let s = spec(0x86, 4, 75, 6);
+        let ops = plan_reads(&s, MAX_READ_BYTES).unwrap();
+        assert_eq!(ops[1], ReadOp { word_offset: 40, size: 80 });
+        assert_eq!(ops.last(), Some(&ReadOp { word_offset: 200, size: 50 }));
+        // Second read: 50 04 86 00 28
+        assert_eq!(
+            wire(&s, &ops[1]),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x50, 0x04, 0x86, 0x00, 0x28]
+        );
+        // Last read: 32 04 86 00 C8
+        assert_eq!(
+            wire(&s, ops.last().unwrap()),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x32, 0x04, 0x86, 0x00, 0xC8]
+        );
+        let covered: usize = ops.iter().map(|o| o.size as usize).sum();
+        assert_eq!(covered, s.total_bytes());
     }
 
     #[test]
-    fn plan_string_file_large_elements() {
-        // ST with 10 elements * 84 bytes = 840 bytes. 240/84 = 2 elements/chunk.
-        let ops = plan_reads(&spec(0x8D, 9, 10, 84), MAX_READ_BYTES).unwrap();
-        assert_eq!(ops[0], ReadOp { element: 0, size: 168 });
-        let covered: u16 = ops.iter().map(|o| o.size as u16 / 84).sum();
-        assert_eq!(covered, 10);
+    fn plan_lad2_uses_extended_word_offset() {
+        // LAD2 (type 0x22): 696 bytes = 348 words. The word offset passes 254 and
+        // switches to the FF lo hi extended form. (element_bytes is irrelevant to
+        // planning; 348*2 just gives the total length.)
+        let s = spec(0x22, 2, 348, 2);
+        let ops = plan_reads(&s, MAX_READ_BYTES).unwrap();
+        // Read at word 280 (0x0118), full 80 bytes: 50 02 22 00 FF 18 01
+        let at280 = ops.iter().find(|o| o.word_offset == 280).unwrap();
+        assert_eq!(at280.size, 80);
+        assert_eq!(
+            wire(&s, at280),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x50, 0x02, 0x22, 0x00, 0xFF, 0x18, 0x01]
+        );
+        // Final read at word 320 (0x0140), 56 bytes: 38 02 22 00 FF 40 01
+        assert_eq!(ops.last(), Some(&ReadOp { word_offset: 320, size: 56 }));
+        assert_eq!(
+            wire(&s, ops.last().unwrap()),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x38, 0x02, 0x22, 0x00, 0xFF, 0x40, 0x01]
+        );
+        let covered: usize = ops.iter().map(|o| o.size as usize).sum();
+        assert_eq!(covered, s.total_bytes());
     }
 
     #[test]
-    fn plan_rejects_oversized_element() {
-        assert!(plan_reads(&spec(0x99, 0, 1, 300), MAX_READ_BYTES).is_err());
-        assert!(plan_reads(&spec(0x99, 0, 1, 0), MAX_READ_BYTES).is_err());
+    fn plan_string_file_crosses_element_boundaries() {
+        // ST (type 0x8D): 10 elements * 84 bytes = 840 bytes = 420 words. The
+        // 84-byte element is NOT respected; reads are still 80-byte / 40-word.
+        let s = spec(0x8D, 9, 10, 84);
+        let ops = plan_reads(&s, MAX_READ_BYTES).unwrap();
+        assert_eq!(ops[0], ReadOp { word_offset: 0, size: 80 });
+        assert_eq!(ops[1], ReadOp { word_offset: 40, size: 80 });
+        let covered: usize = ops.iter().map(|o| o.size as usize).sum();
+        assert_eq!(covered, 840);
+        // 840 / 80 = exactly 10.5 → 10 full reads + a 40-byte tail.
+        assert_eq!(ops.last(), Some(&ReadOp { word_offset: 400, size: 40 }));
     }
 
     #[test]
-    fn read_request_bytes_match_capture_shape() {
-        // A whole-file read of N7 element 0, 2 bytes, must encode exactly as the
-        // public DF1 protected-typed-read: CMD=0F STS=00 TNS=0001 FNC=A2
-        // size=02 file=07 type=89 elem=00 sub=00.
-        let addr = read_addr(0x89, 7, 0);
-        let enc = pccc::slc_typed_read_addr(1, 2, &addr).encode();
-        assert_eq!(enc, vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x02, 0x07, 0x89, 0x00, 0x00]);
+    fn plan_first_read_request_bytes() {
+        // First read of N7 element 0 / word 0, 80 bytes:
+        // CMD=0F STS=00 TNS=0001 FNC=A2 size=50 file=07 type=89 elem=00 sub=00.
+        let s = spec(0x89, 7, 252, 2);
+        let ops = plan_reads(&s, MAX_READ_BYTES).unwrap();
+        assert_eq!(
+            wire(&s, &ops[0]),
+            vec![0x0F, 0x00, 0x01, 0x00, 0xA2, 0x50, 0x07, 0x89, 0x00, 0x00]
+        );
     }
 
     #[test]
-    fn read_request_uses_extended_address_past_254() {
-        // Element 300 must use the FF lo hi extended form (300 = 0x012C).
-        let addr = read_addr(0x89, 7, 300);
-        let enc = pccc::slc_typed_read_addr(1, 2, &addr).encode();
-        assert!(enc.windows(3).any(|w| w == [0xFF, 0x2C, 0x01]));
+    fn plan_rejects_unaligned_total() {
+        // An odd byte total is never word-addressable; refuse rather than guess.
+        assert!(plan_reads(&spec(0x99, 0, 1, 1), MAX_READ_BYTES).is_err());
+    }
+
+    #[test]
+    fn plan_empty_file_no_reads() {
+        assert!(plan_reads(&spec(0x89, 7, 0, 2), MAX_READ_BYTES).unwrap().is_empty());
     }
 
     #[test]
